@@ -1,0 +1,90 @@
+spring:
+  application:
+    name: spring-ai-rag-advanced
+
+  ai:
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        options:
+          model: llama3.2
+      embedding:
+        options:
+          model: all-minilm
+    chat:
+      memory:
+        repository:
+          jdbc:
+            # creates the SPRING_AI_CHAT_MEMORY table for embedded DBs (H2).
+            # For a real Postgres, set this to 'always' or run schema-postgresql.sql yourself.
+            initialize-schema: embedded
+    vectorstore:
+      # MariaDBVectorStore needs MariaDB 11.7+ (VECTOR type); the default H2
+      # profile can't host it, so it's only switched on in the 'mysql' profile.
+      type: none
+
+# chat-memory backend:  inmemory (default) | jdbc
+app:
+  chat-memory:
+    type: inmemory
+
+  # ETL pipeline (DataLoaderService -> TransformerService -> VectorStore).
+  rag:
+    ingestion:
+      location: classpath:docs/*.pdf   # Ant-style pattern; matches every PDF under resources/docs
+      chunk-size: 500                  # tokens per chunk, passed to TokenTextSplitter
+
+server:
+  port: 8088
+
+logging:
+  level:
+    # SimpleLoggerAdvisor prints the request + response here
+    org.springframework.ai.chat.client.advisor: DEBUG
+
+---
+# ============================================================================
+#  'mysql' profile: persist chat history AND the vector store to MariaDB.
+#  Activate it, e.g.:
+#     SPRING_PROFILES_ACTIVE=mysql MYSQL_PASSWORD=yourpass mvn spring-boot:run
+#  or in IntelliJ: Run config -> env var SPRING_PROFILES_ACTIVE=mysql;MYSQL_PASSWORD=...
+#
+#  Needs MariaDB 11.7+ (for the VECTOR column type). Quick start:
+#     docker run -d --name mariadb1 -p 3308:3306 \
+#       -e MARIADB_ROOT_PASSWORD=password -e MARIADB_DATABASE=spring_ai_yt mariadb:11.8
+#
+#  IMPORTANT: the URL must be jdbc:mariadb:// (MariaDB Connector/J). The MySQL
+#  driver can't encode MariaDB's native VECTOR type and the embedding INSERT
+#  fails with "Incorrect vector value".
+#
+#  initialize-schema -> runs the bundled schema-mariadb.sql (chat memory) and
+#  builds the 'vector_store' table; both are idempotent.
+# ============================================================================
+spring:
+  config:
+    activate:
+      on-profile: mysql
+  datasource:
+    # createDatabaseIfNotExist=true -> the driver creates the schema on first
+    # connect, so there is no manual "CREATE DATABASE spring_ai_yt" step.
+    url: ${MYSQL_URL:jdbc:mariadb://localhost:3308/spring_ai_yt?createDatabaseIfNotExist=true}
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:}
+  ai:
+    chat:
+      memory:
+        repository:
+          jdbc:
+            initialize-schema: always
+    vectorstore:
+      type: mariadb
+      mariadb:
+        # builds the 'vector_store' table on startup against the same datasource
+        initialize-schema: true
+        # all-minilm produces 384-dim vectors; must match the embedding model
+        dimensions: 384
+        distance-type: COSINE
+
+app:
+  chat-memory:
+    type: jdbc

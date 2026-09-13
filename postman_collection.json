@@ -1,0 +1,83 @@
+{
+  "info": {
+    "name": "spring-ai-rag-advanced",
+    "description": "ETL pipeline + modular RAG over a MariaDB vector store. Run with the 'mysql' profile (needs MariaDB 11.7+ and Ollama with llama3.2 + all-minilm).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8088", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "ETL pipeline",
+      "description": "Extract (PagePdfDocumentReader) -> Transform (TokenTextSplitter) -> Load (VectorStore). Reads every PDF under app.rag.ingestion.location (default classpath:docs/*.pdf).",
+      "item": [
+        {
+          "name": "ingest - run the pipeline once",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/rag/ingest",
+              "host": ["{{baseUrl}}"],
+              "path": ["rag", "ingest"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "RAG chat (per-user memory via X-User-Id header)",
+      "description": "The X-User-Id header value becomes the chat-memory conversation id, so every user has an isolated RAG conversation. Missing header -> 400. Answers are grounded on whatever /rag/ingest has loaded into the vector store.",
+      "item": [
+        {
+          "name": "ask - what are the ETL stages?",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-User-Id", "value": "alice" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/rag/ask?question=What are the three stages of the ETL pipeline?",
+              "host": ["{{baseUrl}}"],
+              "path": ["rag", "ask"],
+              "query": [
+                { "key": "question", "value": "What are the three stages of the ETL pipeline?" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "ask - follow-up (same header, uses conversation memory)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-User-Id", "value": "alice" }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/rag/ask?question=Which of those uses a VectorStore?",
+              "host": ["{{baseUrl}}"],
+              "path": ["rag", "ask"],
+              "query": [
+                { "key": "question", "value": "Which of those uses a VectorStore?" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "ask - missing X-User-Id header -> 400",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/rag/ask?question=What does RAG combine?",
+              "host": ["{{baseUrl}}"],
+              "path": ["rag", "ask"],
+              "query": [
+                { "key": "question", "value": "What does RAG combine?" }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
