@@ -1,16 +1,8 @@
-# spring-ai-playground
+# spring-ai-rag-advanced
 
-A working tour of **Spring AI 2.0** on **Spring Boot 4** — every major feature wired up
-as a small, runnable endpoint against **local models via Ollama** (no API keys, no cost).
-
-It started as a chat demo; it now covers multi-model routing, prompt templates,
-structured output, custom + built-in advisors, reactive streaming, chat memory
-(in-memory **and** JDBC/MariaDB), embeddings, and **modular RAG** over a MariaDB
-vector store.
-
-> **Companion write-up — [Spring AI Field Guide](https://temptation4.github.io/spring-ai-playground/):**
-> an illustrated walk-through of the same concepts (ChatClient, advisors, RAG, the
-> four-phase modular RAG pipeline), with animated diagrams.
+An ETL pipeline that loads PDFs into a MariaDB vector store, and a modular RAG
+service (`RetrievalAugmentationAdvisor`) that answers questions grounded on what
+was loaded — Spring AI 2.0 on Spring Boot 4, local models via Ollama.
 
 ---
 
@@ -21,22 +13,16 @@ vector store.
 | Spring AI | 2.0.0 |
 | Spring Boot | 4.0.1 |
 | Java | 21 |
-| Models | Ollama — `llama3.2`, `qwen2.5:1.5b`, `all-minilm` (embeddings) |
-| Vector store | MariaDB 11.7+ native `VECTOR` type (`mysql` profile) |
-| Chat memory | in-memory (default) or JDBC → MariaDB (`mysql` profile) |
+| Models | Ollama — `llama3.2` (chat), `all-minilm` (embeddings) |
+| Vector store | MariaDB 11.7+ native `VECTOR` type |
 | Port | `8088` |
-
----
 
 ## Prerequisites
 
 ```bash
-# 1. Ollama with the three models
 ollama pull llama3.2
-ollama pull qwen2.5:1.5b
 ollama pull all-minilm
 
-# 2. (only for the 'mysql' profile) MariaDB 11.7+ for the vector store + JDBC chat memory
 docker run -d --name mariadb1 -p 3308:3306 \
   -e MARIADB_ROOT_PASSWORD=password \
   -e MARIADB_DATABASE=spring_ai_yt \
@@ -45,134 +31,99 @@ docker run -d --name mariadb1 -p 3308:3306 \
 
 ## Run
 
-**Default** — in-memory chat memory; the vector-store endpoints return `503`:
-
-```bash
-mvn spring-boot:run
-```
-
-**`mysql` profile** — chat history + vector store persisted to MariaDB:
-
 ```bash
 SPRING_PROFILES_ACTIVE=mysql MYSQL_PASSWORD=password mvn spring-boot:run
+mvn test   # 5 tests, no Ollama / DB needed (PDF reading is real, everything else mocked)
 ```
 
 The datasource defaults to `jdbc:mariadb://localhost:3308/spring_ai_yt` and creates the
 schema on first connect. Override with `MYSQL_URL` / `MYSQL_USER` / `MYSQL_PASSWORD`.
-It **must** be a `jdbc:mariadb://` URL — the MySQL driver can't encode MariaDB's native
+Must be a `jdbc:mariadb://` URL — the MySQL driver can't encode MariaDB's native
 `VECTOR` type.
-
-```bash
-mvn test        # 19 tests, no Ollama / DB needed (models are mocked)
-```
 
 ---
 
-## What's inside
+## ETL pipeline
 
-### Multi-model routing — `config/ModelConfig.java`
-Three `ChatClient` beans over one auto-configured `ChatModel`, each pinning a different
-Ollama model via `OllamaChatOptions.model(...)`:
+Three classes, one per stage, orchestrated by `IngestionService`:
 
-| Bean (`@Qualifier`) | Model | Temp | For |
-|---|---|---|---|
-| `precise` | `llama3.2` | 0.2 | factual answers |
-| `creative` | `qwen2.5:1.5b` | 0.9 | expressive answers |
-| `rag` | `llama3.2` | 0.0 | grounded RAG answers, larger token budget |
+| Stage | Class | Does |
+|---|---|---|
+| **Extract** | `service/etl/DataLoaderService.java` | `PagePdfDocumentReader` reads every PDF matched by `app.rag.ingestion.location` (default `classpath:docs/*.pdf`) - one `Document` per page |
+| **Transform** | `service/etl/TransformerService.java` | `TokenTextSplitter` cuts each page into smaller, embedding-sized chunks (`app.rag.ingestion.chunk-size`, default 500 tokens) |
+| **Load** | `service/etl/IngestionService.java` | hands the chunks to `VectorStore.add(...)`, which embeds each one (`all-minilm`) and persists it to the `vector_store` table |
 
-### Advisors — `config/AdvisorConfig.java`, `advisor/TokenPrintAdvisor.java`
-- **`TokenPrintAdvisor`** (custom) — implements both `CallAdvisor` and `StreamAdvisor`;
-  logs the prompt, the reply and token usage around every call.
-- **`SimpleLoggerAdvisor`** (built-in) — full request/response at `DEBUG`.
-- **`SafeGuardAdvisor`** (built-in) — short-circuits before the model when the prompt
-  contains a blocked word (`password`, `secret`, `api key`, `credit card`).
-- Applied globally through a `ChatClientCustomizer`.
+Triggered by:
 
-### Prompt templates — `service/InterviewService.java` + `src/main/resources/prompts/*.st`
-`PromptTemplate` / `SystemPromptTemplate`, fluent `.param(...)`, templates loaded from
-`.st` resource files, and Ollama JSON mode (`format: "json"`) for reliable structured
-output.
+```
+POST /rag/ingest
+```
 
-### Structured output
-`.call().entity(InterviewQuestion.class)` and
-`.entity(new ParameterizedTypeReference<List<InterviewQuestion>>() {})`.
+```json
+{"pagesLoaded": 1, "chunksStored": 1}
+```
 
-### Streaming — `controller/StreamController.java`, `service/StreamService.java`
-`ChatClient.stream()` → `Flux<String>`; `spring-boot-starter-webflux` on the classpath,
-still running on the servlet stack. One endpoint aggregates raw token fragments into
-whole sentences with `bufferUntil(...)`.
+A sample PDF ships at `src/main/resources/docs/sample-spring-ai.pdf` so this works
+out of the box - drop your own PDFs in `src/main/resources/docs/` and re-run.
 
-### Chat memory — `config/ChatMemoryConfig.java`, `service/AiService.java`
-`MessageChatMemoryAdvisor` + `MessageWindowChatMemory` (20 messages). Backend selected
-by `app.chat-memory.type`:
-- `inmemory` — `InMemoryChatMemoryRepository` (default)
-- `jdbc` — `JdbcChatMemoryRepository` → `SPRING_AI_CHAT_MEMORY` table (auto-selected by
-  the `mysql` profile)
+---
 
-The `X-User-Id` header on `GET /ai/ask` becomes the `conversation_id`, so every caller
-gets an isolated history.
+## RAG implementation
 
-### Embeddings — `service/EmbeddingService.java`
-`EmbeddingModel` (`all-minilm`, 384-dim). A hand-rolled cosine-similarity search over a
-handful of in-memory docs — the "what a `VectorStore` does for you" teaching version.
+`service/RagService.java` builds a `RetrievalAugmentationAdvisor` per request, one
+Spring AI module per phase:
 
-### RAG over a MariaDB vector store — `service/VectorStoreService.java`
-- `spring-ai-starter-vector-store-mariadb` → `MariaDBVectorStore`, table `vector_store`,
-  384-dim, cosine distance, schema built on startup.
-- `POST /ai/vector/save` embeds + stores plain strings as `Document`s.
-- `GET /ai/vector/ask` answers grounded on the stored docs. The
-  [Field Guide](https://temptation4.github.io/spring-ai-playground/) covers wiring the
-  **modular** `RetrievalAugmentationAdvisor` pipeline
-  (pre-retrieval → retrieval → post-retrieval → generation) on top of this.
+```java
+RetrievalAugmentationAdvisor.builder()
+    .queryTransformers(RewriteQueryTransformer..., TranslationQueryTransformer...)
+    .queryExpander(MultiQueryExpander...)
+    .documentRetriever(VectorStoreDocumentRetriever.builder()
+            .vectorStore(vectorStore).topK(3).similarityThreshold(0.5).build())
+    .documentJoiner(new ConcatenationDocumentJoiner())
+    .queryAugmenter(ContextualQueryAugmenter.builder().allowEmptyContext(true).build())
+    .order(-100)
+    .build();
+```
 
-### Tool calling — `tool/EmployeeTool.java`, `controller/ToolController.java`
-An `@Tool`-annotated method the model invokes automatically inside one `.call()`.
+- **Query transformation** — `RewriteQueryTransformer` turns a chatty question into a
+  search-friendly one; `TranslationQueryTransformer` normalizes it to English.
+- **Query expansion** — `MultiQueryExpander` fans one question into several phrasings
+  so recall doesn't hinge on exact wording.
+- **Retrieval** — `VectorStoreDocumentRetriever` runs a similarity search per query
+  (`similarityThreshold: 0.5` - keeps unrelated chunks out); `ConcatenationDocumentJoiner`
+  merges the per-query results.
+- **Generation** — `ContextualQueryAugmenter` folds the retrieved chunks into the
+  prompt; `allowEmptyContext(true)` lets it still answer (gracefully) when nothing
+  matched, instead of erroring.
+- **Memory** — `MessageChatMemoryAdvisor` keeps each caller's history separate, keyed
+  by the `X-User-Id` header.
+
+Triggered by:
+
+```
+GET /rag/ask?question=...
+Header: X-User-Id: <any id>
+```
 
 ---
 
 ## Endpoints
 
-All under `http://localhost:8088`.
-
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/ai/ask?question=` | chat **with memory**; requires header `X-User-Id: <id>` |
-| `GET` | `/ai/precise?question=` | `llama3.2`, temperature 0.2 |
-| `GET` | `/ai/creative?question=` | `qwen2.5:1.5b`, temperature 0.9 |
-| `GET` | `/ai/stream?question=` | `text/plain`, sentence-buffered stream |
-| `GET` | `/ai/stream-raw?question=` | `text/plain`, raw token fragments |
-| `GET` | `/ai/stream-sse?question=` | `text/event-stream` |
-| `GET` | `/ai/interview?topic=` | one `InterviewQuestion` (structured output, JSON mode) |
-| `GET` | `/ai/interviews?topics=` | `List<InterviewQuestion>` |
-| `GET` | `/ai/explain?tech=&example=Java` | manual `Prompt` from `PromptTemplate` + `SystemPromptTemplate` |
-| `GET` | `/ai/explain-file?tech=&example=Java` | same, template from `prompts/explain.st` |
-| `GET` | `/ai/embed?text=` | raw 384-dim vector |
-| `GET` | `/ai/similar?query=&topK=3` | cosine-ranked in-memory docs |
-| `POST` | `/ai/vector/save` | body: `["text one","text two"]` — embed + store *(mysql profile)* |
-| `GET` | `/ai/vector/search?query=&topK=3` | nearest stored docs *(mysql profile)* |
-| `GET` | `/ai/vector/ask?question=` | RAG answer grounded on stored docs *(mysql profile)* |
-| `GET` | `/ai/employee?question=` | model calls the `@Tool` method |
+| `POST` | `/rag/ingest` | runs the ETL pipeline once |
+| `GET` | `/rag/ask?question=` | RAG answer with memory; requires header `X-User-Id: <id>` (missing → 400) |
 
-`postman_collection.json` has all of these ready to import.
+`postman_collection.json` has both, in the right order.
 
 ### Quick check
 
 ```bash
-# chat with memory
-curl -H "X-User-Id: alice" "http://localhost:8088/ai/ask?question=my name is Alice"
-curl -H "X-User-Id: alice" "http://localhost:8088/ai/ask?question=what is my name?"
+curl -X POST http://localhost:8088/rag/ingest
 
-# RAG (mysql profile)
-curl -X POST http://localhost:8088/ai/vector/save -H 'Content-Type: application/json' \
-  -d '["Tomatoes need daily light watering while establishing.","Wheat is sown in November and December in north India."]'
-curl "http://localhost:8088/ai/vector/ask?question=when is wheat sown?"
+curl -H "X-User-Id: alice" \
+  "http://localhost:8088/rag/ask?question=What are the three stages of the ETL pipeline?"
+
+curl -H "X-User-Id: alice" \
+  "http://localhost:8088/rag/ask?question=Which one uses a VectorStore?"   # uses memory
 ```
-
----
-
-## Notes
-
-- The Java package is still `com.example.springaidemo` — it's a learning repo.
-- `all-minilm` similarity scores are compressed (~0.7 for a strong match), so the RAG
-  `similarityThreshold` is kept modest (0.5).
-- No secrets in the repo: the MariaDB password comes from the `MYSQL_PASSWORD` env var.
